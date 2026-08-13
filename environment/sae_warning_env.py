@@ -5,21 +5,6 @@ from gymnasium import spaces
 
 
 class SAEWarningEnv(gym.Env):
-    """
-    Offline temporal RL environment for early warning
-    of neurological deterioration associated with SAE.
-
-    One ICU stay is treated as one episode.
-
-    Actions:
-        0 = Routine monitoring
-        1 = Increased surveillance
-        2 = Clinical escalation
-
-    State:
-        [GCS, GCS_change, MAP, Heart Rate,
-         Respiratory Rate, SpO2, ICU hour]
-    """
 
     metadata = {"render_modes": ["human"]}
 
@@ -29,18 +14,15 @@ class SAEWarningEnv(gym.Env):
 
         self.df = dataframe.copy()
 
-        # --------------------------------------------------
-        # Required columns
-        # --------------------------------------------------
-
+        # RL state
         self.state_columns = [
-            "gcs_total",
-            "gcs_change",
-            "map",
+            "gcs_last_observed",
+            "previous_observed_gcs",
             "heart_rate",
+            "map",
             "resp_rate",
             "spo2",
-            "hour",
+            "hour"
         ]
 
         required_columns = [
@@ -48,8 +30,8 @@ class SAEWarningEnv(gym.Env):
             "hadm_id",
             "icustay_id",
             "hour",
-            *self.state_columns,
-            "deterioration",
+            "future_sae_1h",
+            *self.state_columns
         ]
 
         missing = [
@@ -59,62 +41,44 @@ class SAEWarningEnv(gym.Env):
 
         if missing:
             raise ValueError(
-                f"Missing required columns: {missing}"
+                f"Missing columns: {missing}"
             )
 
-        # --------------------------------------------------
-        # Sort temporal data
-        # --------------------------------------------------
-
+        # Keep chronological order
         self.df = self.df.sort_values(
             ["icustay_id", "hour"]
         ).reset_index(drop=True)
 
-        # --------------------------------------------------
-        # Group ICU stays into episodes
-        # --------------------------------------------------
-
+        # One ICU stay = one episode
         self.episodes = {
             stay_id: group.reset_index(drop=True)
-            for stay_id, group
-            in self.df.groupby("icustay_id")
+            for stay_id, group in self.df.groupby("icustay_id")
         }
 
         self.stay_ids = list(self.episodes.keys())
 
-        # Current episode
+        # 3 warning actions
+        self.action_space = spaces.Discrete(3)
+
+        # 7-dimensional state
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(len(self.state_columns),),
+            dtype=np.float32
+        )
+
         self.current_episode = None
         self.current_stay_id = None
         self.current_step = 0
 
-        # --------------------------------------------------
-        # Action space
-        # --------------------------------------------------
-
-        self.action_space = spaces.Discrete(3)
-
-        # --------------------------------------------------
-        # State space
-        #
-        # We use normalized/clipped continuous values.
-        # --------------------------------------------------
-
-        self.observation_space = spaces.Box(
-            low=-10.0,
-            high=10.0,
-            shape=(len(self.state_columns),),
-            dtype=np.float32,
-        )
-
-    # ======================================================
-    # STATE
-    # ======================================================
-
     def _get_state(self):
 
-        row = self.current_episode.iloc[self.current_step]
+        row = self.current_episode.iloc[
+            self.current_step
+        ]
 
-        values = []
+        state = []
 
         for column in self.state_columns:
 
@@ -123,62 +87,43 @@ class SAEWarningEnv(gym.Env):
             if pd.isna(value):
                 value = 0.0
 
-            values.append(float(value))
+            state.append(float(value))
 
-        state = np.asarray(
-            values,
+        return np.asarray(
+            state,
             dtype=np.float32
         )
 
-        return state
+    def _get_reward(self, action, future_sae):
 
-    # ======================================================
-    # REWARD
-    # ======================================================
+       if future_sae == 0:
 
-    def _calculate_reward(self, action, deterioration):
+                if action == 0:
+                    return 1.0
 
-        # ----------------------------------------------
-        # No deterioration
-        # ----------------------------------------------
+                elif action == 1:
+                    return -0.5
 
-        if deterioration == 0:
+                elif action == 2:
+                    return -2.0
+       else:
 
-            if action == 0:
-                return 1.0
+                if action == 0:
+                    return -5.0
 
-            elif action == 1:
-                return -0.5
+                elif action == 1:
+                    return 3.0
 
-            elif action == 2:
-                return -2.0
+                elif action == 2:
+                    return 5.0
 
-        # ----------------------------------------------
-        # Deterioration
-        # ----------------------------------------------
-
-        else:
-
-            if action == 0:
-                return -5.0
-
-            elif action == 1:
-                return 3.0
-
-            elif action == 2:
-                return 5.0
-
-        return 0.0
-
-    # ======================================================
-    # RESET
-    # ======================================================
+                    return 0.0
 
     def reset(self, *, seed=None, options=None):
 
         super().reset(seed=seed)
 
-        # Select an ICU stay
+        # Random ICU stay
         self.current_stay_id = self.np_random.choice(
             self.stay_ids
         )
@@ -194,17 +139,11 @@ class SAEWarningEnv(gym.Env):
         info = {
             "icustay_id": self.current_stay_id,
             "hour": int(
-                self.current_episode.iloc[
-                    self.current_step
-                ]["hour"]
-            ),
+                self.current_episode.iloc[0]["hour"]
+            )
         }
 
         return state, info
-
-    # ======================================================
-    # STEP
-    # ======================================================
 
     def step(self, action):
 
@@ -219,52 +158,51 @@ class SAEWarningEnv(gym.Env):
             self.current_step
         ]
 
-        deterioration = int(
-            current_row["deterioration"]
-        )
+        sae = int(current_row["sae"])
 
-        reward = self._calculate_reward(
+        future_sae = int(
+    current_row["future_sae_1h"]
+)
+
+        reward = self._get_reward(
             action,
-            deterioration
-        )
+            future_sae
+        )   
 
-        # Move forward one hour
         self.current_step += 1
 
         terminated = (
-            self.current_step
-            >= len(self.current_episode)
+            self.current_step >=
+            len(self.current_episode)
         )
 
         truncated = False
 
         if terminated:
 
-            # Return final state
-            next_state = self._get_state()
+            next_state = np.zeros(
+                len(self.state_columns),
+                dtype=np.float32
+            )
 
         else:
 
             next_state = self._get_state()
 
         info = {
-            "icustay_id": self.current_stay_id,
-            "hour": int(current_row["hour"]),
-            "deterioration": deterioration,
-            "action": action,
-        }
+       "icustay_id": self.current_stay_id,
+       "hour": int(current_row["hour"]),
+       "future_sae": future_sae,
+       "action": action
+}
 
         return (
             next_state,
             reward,
             terminated,
             truncated,
-            info,
+            info
         )
-
-    # ======================================================
-    # RENDER
-    # ======================================================
 
     def render(self):
 
